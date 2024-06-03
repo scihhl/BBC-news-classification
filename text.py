@@ -196,63 +196,81 @@ class DataCleaner(DataAnalyzer):
             self.test_data = self.preprocess_texts(self.test_data)
 
 
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, classification_report
+# Basic class
 import numpy as np
 import spacy
+import matplotlib.pyplot as plt
+from sklearn.decomposition import NMF, TruncatedSVD
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_selection import chi2, SelectKBest
 
-# 基类
+
 class FeatureExtractor:
     def __init__(self, data):
         self.data = data
-        self.model = LogisticRegression()
+        self.features = None
 
     def extract_features(self):
         raise NotImplementedError("Subclasses should implement this method!")
 
-    def train_model(self, X, y):
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-        self.model.fit(X_train, y_train)
-        preds = self.model.predict(X_test)
-        print("Accuracy:", accuracy_score(y_test, preds))
-        print("Classification Report:\n", classification_report(y_test, preds))
+    def visualize_features(self):
+        if self.features is not None:
+            plt.figure(figsize=(10, 6))
+            plt.spy(self.features)
+            plt.title('Feature Matrix Visualization')
+            plt.xlabel('Features')
+            plt.ylabel('Documents')
+            plt.show()
+        else:
+            print("No features to visualize.")
 
-# 子类 - TF-IDF
+    def feature_selection(self, labels, num_features=500):
+        selector = SelectKBest(chi2, k=num_features)
+        selected_features = selector.fit_transform(self.features, labels)
+        return selected_features
+
+    def apply_matrix_factorization(self, n_components=5, method='NMF'):
+        if method == 'NMF':
+            model = NMF(n_components=n_components, init='random', random_state=0)
+        elif method == 'SVD':
+            model = TruncatedSVD(n_components=n_components)
+        else:
+            raise ValueError("Unsupported factorization method.")
+
+        W = model.fit_transform(self.features)
+        H = model.components_
+        return W, H
+
+    # Subclass
 class TFIDFFeatureExtractor(FeatureExtractor):
     def __init__(self, data):
         super().__init__(data)
         self.vectorizer = TfidfVectorizer(max_df=0.7, min_df=5, stop_words='english')
 
     def extract_features(self):
-        return self.vectorizer.fit_transform(self.data['Processed_Text'])
+        self.features = self.vectorizer.fit_transform(self.data['Processed_Text'])
+        return self.features
 
-# 子类 - Embedding
+    # 子类 - Embedding
 class EmbeddingFeatureExtractor(FeatureExtractor):
     def __init__(self, data):
         super().__init__(data)
         self.nlp = spacy.load('en_core_web_lg')
 
     def document_vector(self, doc):
+        """Generate document vectors by averaging word vectors, handling cases where no word has a vector."""
         doc = self.nlp(doc)
-        return np.mean([word.vector for word in doc if not word.is_stop and word.has_vector], axis=0)
+        vectors = [word.vector for word in doc if not word.is_stop and word.has_vector]
+        if vectors:
+            return np.mean(vectors, axis=0)
+        else:
+            # Return a zero vector if no word has a vector
+            return np.zeros((300,))  # 300 is the dimensionality of GloVe vectors in 'en_core_web_lg'
 
     def extract_features(self):
-        return np.array([self.document_vector(text) for text in self.data['Processed_Text']])
-
-# 使用示例
-cleaner = DataCleaner(analyzer)  # 假设analyzer是已经定义好的
-cleaner.data_process()  # 处理数据
-
-tfidf_extractor = TFIDFFeatureExtractor(cleaner.train_data)
-tfidf_features = tfidf_extractor.extract_features()
-tfidf_extractor.train_model(tfidf_features, cleaner.train_data['Category'])
-
-embedding_extractor = EmbeddingFeatureExtractor(cleaner.train_data)
-embedding_features = embedding_extractor.extract_features()
-embedding_extractor.train_model(embedding_features, cleaner.train_data['Category'])
-
+        """Use document_vector method to create feature matrix."""
+        self.features = np.array([self.document_vector(text) for text in self.data['Processed_Text']])
+        return self.features
 
 
 if __name__ == '__main__':
@@ -265,3 +283,16 @@ if __name__ == '__main__':
     cleaner.data_process()
     cleaner.perform_eda(cleaner.train_data, target_column='Processed_Text')
 
+    tfidf_extractor = TFIDFFeatureExtractor(cleaner.train_data)
+    tfidf_features = tfidf_extractor.extract_features()
+
+    tfidf_extractor.visualize_features()
+    selected_features = tfidf_extractor.feature_selection(cleaner.train_data['Category'])
+    W, H = tfidf_extractor.apply_matrix_factorization()
+
+    print("Matrix W (document-topic weights):", W.shape)
+    print("Matrix H (topic-feature weights):", H.shape)
+
+    embedding_extractor = EmbeddingFeatureExtractor(cleaner.train_data)
+    embedding_features = embedding_extractor.extract_features()
+    embedding_extractor.visualize_features()
