@@ -110,18 +110,11 @@ train_data = analyzer.load_data('data/BBC News Train.csv', is_train=True)
 test_data = analyzer.load_data('data/BBC News Test.csv', is_train=False)
 analyzer.perform_eda(train_data)
 
-
-#%%
-import nltk
-from nltk.corpus import stopwords
-from nltk.stem import WordNetLemmatizer
-nltk.download('stopwords')
-nltk.download('wordnet')
-
 # redefine the class DataCleaner
 import string
 from nltk import pos_tag, word_tokenize
 from nltk.corpus import wordnet
+import nltk
 
 nltk.download('stopwords')
 nltk.download('wordnet')
@@ -201,26 +194,22 @@ class DataCleaner(DataAnalyzer):
             self.test_data = self.clean_data(self.test_data)
             self.test_data = self.preprocess_texts(self.test_data)
 
+
 cleaner = DataCleaner(analyzer)
 cleaner.data_process()
 cleaner.perform_eda(cleaner.train_data, target_column='Processed_Text')
-
-# Basic class
+print(cleaner.test_data)
 import numpy as np
-import spacy
-import matplotlib.pyplot as plt
-from sklearn.decomposition import NMF, TruncatedSVD
-from sklearn.feature_selection import SelectKBest, mutual_info_classif
-from sklearn.feature_selection import chi2, SelectKBest
+from sklearn.decomposition import TruncatedSVD
+from sklearn.feature_selection import SelectKBest, f_classif
 from scipy.sparse import csr_matrix
-from sklearn.feature_selection import f_classif, SelectKBest
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.feature_selection import f_regression
+
 
 class FeatureExtractor:
-    def __init__(self, cleaner):
+    def __init__(self, cleaner, trim_features=None):
         self.data = cleaner.train_data.copy()
         self.test_data = cleaner.test_data.copy()
+        self.trim_features = trim_features
         self.features = None
         self.W = None
         self.H = None
@@ -228,15 +217,8 @@ class FeatureExtractor:
         self.label_mapping = {}
         self.inverse_label_mapping = {}
         self.create_label_mapping()
-
-    def extract_features(self):
-        raise NotImplementedError("Subclasses should implement this method!")
-
-    def create_label_mapping(self):
-        unique_labels = self.data['Category'].unique()
-        self.label_mapping = {label: idx for idx, label in enumerate(unique_labels)}
-        self.inverse_label_mapping = {idx: label for idx, label in enumerate(unique_labels)}
-        self.data['Category'] = self.data['Category'].map(self.label_mapping).astype(int)
+        self.selector = None
+        self.test_features = None
 
     @staticmethod
     def visualize_features(features):
@@ -250,48 +232,69 @@ class FeatureExtractor:
         norm = plt.Normalize(vmin=-np.max(np.abs(features)), vmax=np.max(np.abs(features)))
         plt.imshow(features, aspect='auto', interpolation='nearest', cmap=cmap, norm=norm)
         plt.colorbar()
-        plt.title('Feature Matrix Visualization')
-        plt.xlabel('Features')
-        plt.ylabel('Documents')
+        plt.title('Matrix Visualization')
+        if features.shape[0] == 5:
+            plt.xlabel('Features')
+            plt.ylabel('Categories')
+        elif features.shape[1] == 5:
+            plt.xlabel('Categories')
+            plt.ylabel('Documents')
+        else:
+            plt.xlabel('Features')
+            plt.ylabel('Documents')
         plt.show()
 
-    def feature_selection(self, labels, num_features=300):
-        # Ensure there are no NaN or infinite values in labels
-        labels = labels.dropna()
+    def extract_features(self):
+        raise NotImplementedError("Subclasses should implement this method!")
 
+    def trim(self):
+        if self.features.shape[1] > self.trim_features:
+            self.selector = SelectKBest(f_classif, k=self.trim_features)
+            self.features = self.selector.fit_transform(self.features, self.data['Category'])
 
-        num_features = min(num_features, self.features.shape[1])  # Ensure k does not exceed n_features
-        selector = SelectKBest(f_classif, k=num_features)
-        self.features = selector.fit_transform(self.features, labels)
-        return self.features
+    def process_test_data(self):
+        if self.trim_features:
+            self.test_features = self.selector.transform(self.test_features)
+        self.W_test = self.model.transform(self.test_features)
 
-    def apply_matrix_factorization(self, n_components=5, method='NMF'):
-        if method == 'NMF':
-            model = NMF(n_components=n_components, init='random', random_state=0)
-        elif method == 'SVD':
-            model = TruncatedSVD(n_components=n_components)
-        else:
-            raise ValueError("Unsupported factorization method.")
+    def create_label_mapping(self):
+        unique_labels = self.data['Category'].unique()
+        self.label_mapping = {label: idx for idx, label in enumerate(unique_labels)}
+        self.inverse_label_mapping = {idx: label for idx, label in enumerate(unique_labels)}
+        self.data['Category'] = self.data['Category'].map(self.label_mapping).astype(int)
 
-        self.W = model.fit_transform(self.features)
-        self.H = model.components_
-        self.model = model
-        return self.W, self.H
+    def SVD_fit(self, features, n_components=5):
+        self.model = TruncatedSVD(n_components=n_components)
+        self.W = self.model.fit_transform(features)
+        self.H = self.model.components_
+
 
 # Subclass-TF-IDF
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+
 class TFIDFFeatureExtractor(FeatureExtractor):
-    def __init__(self, data):
-        super().__init__(data)
-        self.vectorizer = TfidfVectorizer(max_df=0.7, min_df=5, stop_words='english')
+    def __init__(self, cleaner, trim_features=None):
+        super().__init__(cleaner, trim_features=trim_features)
 
     def extract_features(self):
-        self.features = self.vectorizer.fit_transform(self.data['Processed_Text'])
+        self.vectorizer = TfidfVectorizer(max_df=0.7, min_df=5, stop_words='english')
+        self.features = self.vectorizer.fit_transform(self.data['Processed_Text']).toarray()
+        self.test_features = self.vectorizer.transform(self.test_data['Processed_Text']).toarray()
+        if self.trim_features is not None:  # 根据 trim 参数决定是否裁剪特征
+            self.trim()
+        self.SVD_fit(self.features)
+        self.process_test_data()
         return self.features
 
+
 # Subclass-Embedding
+import spacy
+
+
 class EmbeddingFeatureExtractor(FeatureExtractor):
-    def __init__(self, data):
-        super().__init__(data)
+    def __init__(self, cleaner, trim_features=None):
+        super().__init__(cleaner, trim_features=trim_features)
         self.nlp = spacy.load('en_core_web_lg')
 
     def document_vector(self, doc):
@@ -301,70 +304,77 @@ class EmbeddingFeatureExtractor(FeatureExtractor):
         if vectors:
             return np.mean(vectors, axis=0)
         else:
-            # Return a zero vector if no word has a vector
-            return np.zeros((300,))  # 300 is the dimensionality of GloVe vectors in 'en_core_web_lg'
+            return np.zeros((300,))
 
     def extract_features(self):
         """Use document_vector method to create feature matrix."""
         self.features = np.array([self.document_vector(text) for text in self.data['Processed_Text']])
+        self.test_features = np.array([self.document_vector(text) for text in self.test_data['Processed_Text']])
+        if self.trim_features is not None:
+            self.trim()
+        self.SVD_fit(self.features)
+        self.process_test_data()
         return self.features
 
 
-tfidf_extractor = TFIDFFeatureExtractor(cleaner)
-tfidf_features = tfidf_extractor.extract_features()
-tfidf_extractor.visualize_features(tfidf_features)
-#selected_features_tfidf = tfidf_extractor.feature_selection(tfidf_extractor.data['Category'])
-#tfidf_extractor.visualize_features(selected_features_tfidf)
-embedding_extractor = EmbeddingFeatureExtractor(cleaner)
-embedding_features = embedding_extractor.extract_features()
-embedding_extractor.visualize_features(embedding_features)
-
-# selected_features_embedding = embedding_extractor.feature_selection(cleaner.train_data['Category'])
-W1, H1 = tfidf_extractor.apply_matrix_factorization(method='SVD')
-
-print("Matrix W1 (document-topic weights):", W1.shape)
-print("Matrix H1 (topic-feature weights):", H1.shape)
-
-tfidf_extractor.visualize_features(W1)
-tfidf_extractor.visualize_features(H1)
-
-W2, H2 = embedding_extractor.apply_matrix_factorization(method='SVD')
-
-print("Matrix W2 (document-topic weights):", W2.shape)
-print("Matrix H2 (topic-feature weights):", H2.shape)
-
-embedding_extractor.visualize_features(W2)
-embedding_extractor.visualize_features(H2)
-
 import numpy as np
-import matplotlib.pyplot as plt
-from sklearn.decomposition import TruncatedSVD
-from sklearn.feature_extraction.text import TfidfVectorizer
+import pandas as pd
+from sklearn.metrics import confusion_matrix, accuracy_score
 from sklearn.cluster import KMeans
-from sklearn.metrics import accuracy_score, confusion_matrix
-from itertools import permutations
+import matplotlib.pyplot as plt
+import seaborn as sns
 from kaggle.api.kaggle_api_extended import KaggleApi
 
 
 class ModelTrainer:
     def __init__(self, feature_extractor):
-        self.extractor = feature_extractor
-        self.model = self.extractor.model
-        self.W = self.extractor.W
-        self.H = self.extractor.H
-        self.cluster_model = None
-        self.label_mapping = self.extractor.label_mapping
-        self.inverse_label_mapping = self.extractor.inverse_label_mapping
-        self.cluster_to_label_mapping = {}  # 新增的映射变量
-        self.performance_log = []
+        self.features = feature_extractor.features
+        self.W = feature_extractor.W
+        self.H = feature_extractor.H
+        self.svd_model = feature_extractor.model
+        self.label_mapping = feature_extractor.label_mapping
+        self.inverse_label_mapping = feature_extractor.inverse_label_mapping
+        self.true_labels = feature_extractor.data['Category']
+        self.data = feature_extractor.data
+        self.test_data = feature_extractor.test_data
+        self.vectorizer = getattr(feature_extractor, 'vectorizer', None)
+        self.document_vector = getattr(feature_extractor, 'document_vector', None)
+        self.W_test = feature_extractor.W_test
 
-    def cluster_documents(self, n_clusters=5):
-        self.cluster_model = KMeans(n_clusters=n_clusters, random_state=42)
+        self.cluster_model = None
+        self.performance_log = []
+        self.mapping = None
+        self.accuracy = None
+        self.test_pred = None
+        self.train_pred = None
+
+    def train_model(self, plot=False):
+        self.cluster_model = KMeans(n_clusters=5, random_state=42)
         self.cluster_model.fit(self.W)
-        return self.cluster_model.labels_
+
+        predicted_labels_train = self.cluster_model.labels_
+        self.mapping, mapped_labels, self.accuracy = self.find_best_label_mapping(self.true_labels,
+                                                                                  predicted_labels_train)
+        self.train_pred = [self.inverse_label_mapping[label] for label in mapped_labels]
+
+        if plot:
+            self.plot_confusion_matrix(confusion_matrix(self.true_labels, mapped_labels), np.unique(self.true_labels))
+            print(f'accuracy is {self.accuracy}')
+
+    def predict_test_data(self):
+        predicted_labels_test = self.cluster_model.predict(self.W_test)
+
+        mapped_labels_test = [self.mapping[label] for label in predicted_labels_test]
+        predicted_categories = [self.inverse_label_mapping[label] for label in mapped_labels_test]
+
+        self.test_pred = pd.DataFrame({
+            'ArticleId': self.test_data['ArticleId'],
+            'Category': predicted_categories
+        })
 
     @staticmethod
     def find_best_label_mapping(true_labels, predicted_labels):
+        from itertools import permutations
         unique_labels = np.unique(true_labels)
         best_mapping = None
         best_accuracy = 0
@@ -382,68 +392,7 @@ class ModelTrainer:
         return best_mapping, best_mapped_labels, best_accuracy
 
     @staticmethod
-    def submit_to_kaggle_and_get_score(competition, filename, message):
-        api = KaggleApi()
-        api.authenticate()
-        api.competition_submit(file_name=filename, competition=competition, message=message)
-
-    def evaluate_performance(self, true_labels, plot=True):
-        if true_labels is None:
-            raise ValueError("True labels are not provided.")
-
-        true_labels = true_labels.astype(int)
-        predicted_labels = self.cluster_documents(n_clusters=5)
-        self.cluster_to_label_mapping, mapped_labels, best_accuracy = self.find_best_label_mapping(true_labels,
-                                                                                                   predicted_labels)
-
-        conf_matrix = confusion_matrix(true_labels, mapped_labels)
-        if plot:
-            print("Best Accuracy:", best_accuracy)
-            print("Confusion Matrix:\n", conf_matrix)
-            print("Num of features:\n", self.H.shape[1])
-            self.plot_confusion_matrix(conf_matrix, np.unique(true_labels))
-
-        self.performance_log.append({
-            'num_features': self.H.shape[1],
-            'accuracy': best_accuracy
-        })
-        self.predict_new()
-        return best_accuracy, conf_matrix
-
-    def predict_batch(self, new_data):
-        """Transform and predict labels for a batch of new data."""
-        new_features = self.model.transform(new_data)
-        predicted_labels = self.cluster_model.predict(new_features)
-        return predicted_labels
-
-    def predict_new(self):
-        if self.extractor.test_data is None:
-            raise ValueError("Test data is not available.")
-
-        if isinstance(self.extractor, TFIDFFeatureExtractor):
-            test_features = self.extractor.vectorizer.transform(self.extractor.test_data['Processed_Text'])
-        elif isinstance(self.extractor, EmbeddingFeatureExtractor):
-            test_features = np.array(
-                [self.extractor.document_vector(text) for text in self.extractor.test_data['Processed_Text']])
-        else:
-            raise ValueError("Unsupported feature extractor type.")
-
-        predicted_labels = self.predict_batch(test_features)
-
-        numeric_labels = [self.cluster_to_label_mapping[label] for label in predicted_labels]
-
-        predicted_categories = [self.extractor.inverse_label_mapping[label] for label in numeric_labels]
-
-        submission = pd.DataFrame({
-            'ArticleId': self.extractor.test_data['ArticleId'],
-            'Category': predicted_categories
-        })
-        submission.to_csv('submission.csv', index=False)
-        print("Submission file created: submission.csv")
-        # self.submit_to_kaggle_and_get_score(competition='learn-ai-bbc', filename='submission.csv', message='Message')
-
-    @staticmethod
-    def plot_confusion_matrix(self, cm, labels):
+    def plot_confusion_matrix(cm, labels):
         plt.figure(figsize=(10, 7))
         sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=labels, yticklabels=labels)
         plt.xlabel('Predicted')
@@ -451,42 +400,15 @@ class ModelTrainer:
         plt.title('Confusion Matrix')
         plt.show()
 
-    def visualize_feature_matrices(self):
-        plt.figure(figsize=(15, 5))
+    def submit_to_kaggle(self, competition, filename, message):
+        submission = self.test_pred
+        submission.to_csv(filename, index=False)
+        api = KaggleApi()
+        api.authenticate()
+        api.competition_submit(file_name=filename, competition=competition, message=message)
 
-        plt.subplot(1, 2, 1)
-        sns.heatmap(self.W, cmap='viridis')
-        plt.title('W Matrix (Document-Topic)')
-
-        plt.subplot(1, 2, 2)
-        sns.heatmap(self.H, cmap='viridis')
-        plt.title('H Matrix (Topic-Term)')
-
-        plt.show()
-
-    def tune_hyperparameters(self, true_labels, num_features_list):
-        best_accuracy = 0
-        best_params = None
-
-        for num_features in num_features_list:
-            # Feature selection
-            self.extractor.feature_selection(true_labels, num_features)
-
-            # Apply matrix factorization
-            self.W, self.H = self.extractor.apply_matrix_factorization(n_components=5, method='SVD')
-
-            # Evaluate performance
-            accuracy, _ = self.evaluate_performance(true_labels, n_clusters=5, plot=False)
-            if accuracy > best_accuracy:
-                best_accuracy = accuracy
-                best_params = num_features
-
-        print(f"Best params: {best_params} with accuracy: {best_accuracy}")
-        return best_params, best_accuracy
-
-    def plot_performance_log(self):
-        num_features = [log['num_features'] for log in self.performance_log if 'num_features' in log]
-        accuracies = [log['accuracy'] for log in self.performance_log if 'accuracy' in log]
+    @staticmethod
+    def plot_performance_log(num_features, accuracies):
         plt.figure(figsize=(10, 7))
         plt.plot(num_features, accuracies, marker='o')
         plt.xlabel('Number of Features')
@@ -495,16 +417,47 @@ class ModelTrainer:
         plt.grid(True)
         plt.show()
 
-tfidf_trainer = ModelTrainer(tfidf_extractor)
-true_labels = tfidf_extractor.data['Category']  # Accessing the true categories directly
-tfidf_trainer.evaluate_performance(true_labels)
-tfidf_trainer.predict_new()
-embedding_trainer = ModelTrainer(embedding_extractor)
-embedding_trainer.evaluate_performance(true_labels)
-embedding_trainer.predict_new()
+    @staticmethod
+    def hyperparameter_tuning(features_list, cleaner, mode='tfidf'):
+        import gc
+        best_trainer = None
+        best_accuracy = 0
+        accuracies = []
+        best_num = 0
+        test_pred = []
+        train_pred = []
+        for num in features_list:
+            if mode == 'tfidf':
+                extractor = TFIDFFeatureExtractor(cleaner, trim_features=num)
+            elif mode == 'embedding':
+                extractor = EmbeddingFeatureExtractor(cleaner, trim_features=num)
+            else:
+                raise TypeError
+            extractor.extract_features()
+            trainer = ModelTrainer(extractor)
+            trainer.train_model()
+            accuracy = trainer.accuracy
+            accuracies.append(accuracy)
+
+            trainer.predict_test_data()
+            # trainer.submit_to_kaggle('learn-ai-bbc', 'submission.csv', 'Message')
+            test_pred.append(trainer.test_pred)
+            train_pred.append(trainer.train_pred)
+            if best_accuracy < accuracy:
+                best_trainer = trainer
+                best_num = num
+                best_accuracy = accuracy
+            else:
+                del trainer
+                del extractor
+            gc.collect()
+
+        ModelTrainer.plot_performance_log(features_list, accuracies)
+        print(f'The best trainer has {best_num} hyperparameters, with accuracy of {best_accuracy}')
+        return best_trainer, best_accuracy, best_num, accuracies, test_pred, train_pred
+
 
 # Hyperparameter tuning
-num_features_list = [4000, 3000, 2000, 1000, 500]
-num_components_list = [5, 10, 15, 20]
-best_params, best_accuracy = tfidf_trainer.tune_hyperparameters(true_labels, num_features_list, num_components_list)
-tfidf_trainer.plot_performance_log()
+(best_embedding_trainer, best_embedding_accuracy, best_embedding_num, embedding_accuracies,
+ embedding_test_pred, embedding_train_pred) = (
+    ModelTrainer.hyperparameter_tuning([5 * i for i in range(59, 0, -1)], cleaner, mode='embedding'))
